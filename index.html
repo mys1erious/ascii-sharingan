@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Uchiha ASCII Cut</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+  .help {
+    position: fixed; left: 16px; bottom: 12px; margin: 0;
+    font: 11px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    letter-spacing: .04em; color: var(--help, #fff); opacity: .6;
+    pointer-events: none; user-select: none;
+  }
+  .hint {
+    position: fixed; left: 50%; bottom: 44px; transform: translateX(-50%); margin: 0;
+    font: 12px/1.7 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace; letter-spacing: .04em;
+    color: var(--help, #fff); text-align: center; white-space: pre; pointer-events: none; user-select: none;
+    opacity: 0; animation: hint 7s ease .5s forwards;
+  }
+  @keyframes hint { 8% { opacity: .92 } 82% { opacity: .92 } 100% { opacity: 0 } }
+  body.rec .help, body.rec .hint, body.clean .help, body.clean .hint { display: none; }
+  @media (max-width: 600px) { .help { display: none; } .hint { white-space: normal; width: 90vw; } }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="A 20-second ASCII anime cut: rain, a Sharingan eye awakening, a Mangekyō crow burst, a Chidori strike and Amaterasu's black flames. Move to make the eye follow you; hold to charge Chidori."></canvas>
+<p class="hint">click: kunai · hold still: Chidori · swipe fast: slash · hold + draw a circle: Amaterasu
+scroll: Kamui · rest on the iris: Tsukuyomi (shake to break free) · H: hold this beat · → next beat</p>
+<p class="help" id="help">click kunai · hold Chidori · swipe slash · draw ○ Amaterasu · scroll Kamui · rest on iris Tsukuyomi · H hold beat · → beat · ← restart · M sound · 1–4 · G grid · space · fan art, not affiliated with Naruto or Shueisha</p>
+<script>
+(() => {
+  'use strict';
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const help = document.getElementById('help');
+  const q = new URLSearchParams(location.search);
+  const MONO = 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+  const STEP = 1 / 60, LOOP = 20, TAU = Math.PI * 2;
+  const T_CLOSE = 19, T_FIRE_OFF = 19.4; // the eye closes; the flames die
+
+  // ---------- utils ----------
+  function mulberry32(a) {
+    return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  }
+  function hash2(a, b) { let h = Math.imul(a | 0, 374761393) ^ Math.imul(b | 0, 668265263); h = Math.imul(h ^ h >>> 13, 1274126177); return (h ^ h >>> 16) >>> 0; }
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const easeOut = x => 1 - (1 - x) ** 3, easeIn = x => x * x * x;
+  const easeOutBack = x => { const c1 = 1.9, c3 = c1 + 1; return 1 + c3 * (x - 1) ** 3 + c1 * (x - 1) ** 2; };
+  const wrap = a => ((a % TAU) + TAU) % TAU;
+  const wrapPi = a => wrap(a + Math.PI) - Math.PI;
+  const hex = s => [1, 3, 5].map(i => parseInt(s.slice(i, i + 2), 16));
+  const rgba = (c, a) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a.toFixed(3)})`;
+  const CHARS = Array.from({ length: 128 }, (_, i) => String.fromCharCode(i));
+  const C = s => s.charCodeAt(0);
+  const DIRS = [C('-'), C('\\'), C('|'), C('/')];
+  const dirCode = (x, y) => DIRS[((Math.round(Math.atan2(y, x) / (Math.PI / 4)) % 4) + 4) % 4];
+  const RAMP = ' .:-=+*#%@';
+
+  // ---------- sound: all synthesised with WebAudio; starts on your first click or key (browsers require one) ----------
+  const sfx = (() => {
+    let ac = null, out = null, recDest = null, noise = null, on = false, live = false; // off until M
+    let rain, fire, crackle, kamui, sweep, drone;
+    const loopNoise = (type, freq, q) => {
+      const src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+      src.buffer = noise; src.loop = true; f.type = type; f.frequency.value = freq; f.Q.value = q; g.gain.value = 0;
+      src.connect(f).connect(g).connect(out); src.start(); return { f, g };
+    };
+    const osc = (type, freq, lp) => {
+      const o = ac.createOscillator(), g = ac.createGain(); o.type = type; o.frequency.value = freq; g.gain.value = 0;
+      if (lp) { const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lp; o.connect(f).connect(g); } else o.connect(g);
+      g.connect(out); o.start(); return { o, g };
+    };
+    const env = (g, t0, a, peak, dec) => { g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + a); g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + dec); };
+    function tone(type, f0, f1, dur, peak, at = 0) {
+      if (!live || api.quiet) return;
+      const t0 = ac.currentTime + at, o = ac.createOscillator(), g = ac.createGain();
+      o.type = type; o.frequency.setValueAtTime(f0, t0); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+      env(g, t0, 0.005, peak, dur); o.connect(g).connect(out); o.start(t0); o.stop(t0 + dur + 0.05);
+    }
+    function burst(type, f0, f1, dur, peak, q = 1, at = 0) {
+      if (!live || api.quiet) return;
+      const t0 = ac.currentTime + at, src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+      src.buffer = noise; f.type = type; f.Q.value = q; f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+      env(g, t0, 0.004, peak, dur); src.connect(f).connect(g).connect(out); src.start(t0, Math.random()); src.stop(t0 + dur + 0.05);
+    }
+    const api = {
+      quiet: false,
+      init() {
+        if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        ac = new AC();
+        const comp = ac.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
+        out = ac.createGain(); out.gain.value = on ? 0.9 : 0;
+        out.connect(comp); comp.connect(ac.destination);
+        recDest = ac.createMediaStreamDestination(); comp.connect(recDest);
+        noise = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+        const d = noise.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        rain = loopNoise('bandpass', 3800, 0.6); fire = loopNoise('lowpass', 380, 0.7); crackle = loopNoise('bandpass', 5200, 1.4);
+        kamui = osc('sine', 70); sweep = osc('sawtooth', 150, 1800);
+        drone = [osc('sine', 55), osc('sine', 55.7)];
+        live = true;
+      },
+      get stream() { return recDest && recDest.stream; },
+      get enabled() { return on; },
+      toggle() { on = !on; if (out) out.gain.setTargetAtTime(on ? 0.9 : 0, ac.currentTime, 0.05); return on; },
+      boom(p = 1) { tone('sine', 110 * (1 + p * 0.3), 32, 0.5 + 0.6 * p, 0.6 + 0.4 * p); burst('lowpass', 2400, 120, 0.25 + 0.4 * p, 0.35 + 0.4 * p); tone('square', 900, 200, 0.05, 0.08 * p); },
+      shing() { tone('sine', 1760, 1700, 0.5, 0.18); tone('sine', 2637, 2600, 0.35, 0.09); burst('highpass', 6000, 9000, 0.12, 0.1); },
+      crows() {
+        for (let i = 0; i < 28; i++) burst('bandpass', 1200 + Math.random() * 1800, 900, 0.05 + Math.random() * 0.06, 0.12, 3, Math.random() * 1.4);
+        for (let i = 0; i < 4; i++) { const f = 520 + Math.random() * 200; tone('sawtooth', f, f * 0.7, 0.18, 0.05, 0.1 + Math.random() * 1.2); }
+      },
+      whoosh(p = 1) { burst('bandpass', 300, 3200, 0.25 + 0.2 * p, 0.25 * p, 0.8); },
+      thunk() { tone('sine', 220, 90, 0.12, 0.35); burst('highpass', 3000, 2000, 0.03, 0.2); },
+      zap() { burst('bandpass', 5200, 900, 0.3, 0.4, 2); tone('square', 1800, 200, 0.18, 0.08); },
+      ignite() { burst('lowpass', 600, 200, 0.6, 0.4); tone('sine', 70, 40, 0.5, 0.3); },
+      shatter() { burst('highpass', 4000, 9000, 0.6, 0.45); for (let i = 0; i < 10; i++) tone('sine', 2000 + Math.random() * 4000, 1800, 0.25, 0.05, Math.random() * 0.3); },
+      genjutsu() { tone('sine', 220, 55, 1.2, 0.3); },
+      heartbeat() { tone('sine', 62, 40, 0.16, 0.5); tone('sine', 58, 38, 0.18, 0.4, 0.22); },
+      chirps(n) { for (let i = 0; i < n; i++) { const f = 2400 + Math.random() * 3600; tone('triangle', f, f * (0.6 + Math.random() * 0.8), 0.02 + Math.random() * 0.03, 0.06, Math.random() * 0.016); } },
+      pops(n) { for (let i = 0; i < n; i++) burst('bandpass', 800 + Math.random() * 2500, 400, 0.02, 0.12, 4, Math.random() * 0.016); },
+      cue(name) { // the scripted beats
+        if (name === 'awake') { api.boom(0.4); api.genjutsu(); }
+        else if (name === 'tomoe') { api.shing(); api.boom(0.25); }
+        else if (name === 'mangekyo') { api.boom(0.9); api.shing(); }
+        else if (name === 'ignite') api.ignite();
+      },
+      update(v) { // per frame: levels of the continuous beds
+        if (!live) return;
+        const t = ac.currentTime;
+        rain.g.gain.setTargetAtTime(0.16 * v.rain, t, 0.08); rain.f.frequency.setTargetAtTime(v.slow ? 900 : 3800, t, 0.2);
+        fire.g.gain.setTargetAtTime(0.5 * v.fire, t, 0.08);
+        crackle.g.gain.setTargetAtTime(0.08 * v.chidori, t, 0.03);
+        kamui.g.gain.setTargetAtTime(0.3 * v.kamui, t, 0.08); kamui.o.frequency.setTargetAtTime(60 + 40 * v.kamui + 10 * Math.sin(t * 9), t, 0.05);
+        sweep.g.gain.setTargetAtTime(0.06 * v.spin, t, 0.05); sweep.o.frequency.setTargetAtTime(150 + 900 * v.spin, t, 0.05);
+        const df = v.slow ? 41 : 55;
+        for (const [i, d] of drone.entries()) { d.g.gain.setTargetAtTime(0.06 * v.drone, t, 0.3); d.o.frequency.setTargetAtTime(df * (1 + 0.013 * i), t, 0.5); }
+      },
+    };
+    return api;
+  })();
+
+  // what each cell is: the style decides how a role looks
+  const R_INK = 1, R_RED = 2, R_HOT = 3, R_VOID = 4;
+
+  // ---------- the cut ----------
+  const BEATS = [[0, '01', 'RAIN'], [4, '02', 'SHARINGAN'], [8, '03', 'MANGEKYŌ'], [11, '04', 'CHIDORI'], [16, '05', 'AMATERASU']];
+  const IMPACTS = [
+    { t: 4.0, k: 'red', d: 0.08, s: 5, snd: 'awake' }, { t: 5.0, k: 'red', d: 0.05, s: 4, snd: 'tomoe' }, { t: 6.0, k: 'red', d: 0.05, s: 4, snd: 'tomoe' },
+    { t: 7.0, k: 'red', d: 0.06, s: 6, snd: 'tomoe' }, { t: 9.3, k: 'black', d: 0.15, s: 14, snd: 'mangekyo' }, { t: 16.0, k: 'red', d: 0.07, s: 7, snd: 'ignite' },
+  ];
+  const TOMOE_AT = [5, 6, 7];
+  const aperture = t => t < 1.8 ? 0 : t < 3.6 ? easeOut((t - 1.8) / 1.8) : t < T_CLOSE ? 1 : t < T_CLOSE + 0.6 ? 1 - easeOut((t - T_CLOSE) / 0.6) : 0;
+  const eyeAlpha = t => 1 - 0.72 * (smooth(11, 11.5, t) - smooth(14.2, 14.8, t));
+  const irisRed = t => t >= 3.95;
+  const mangekyo = t => t >= 9.3;
+  const rainSpeed = t => t < 7 ? 1 : t < 7.6 ? 1 - smooth(7, 7.6, t) : t < 9.3 ? 0 : smooth(9.3, 9.8, t);
+
+  // ---------- styles ----------
+  const STYLES = [
+    { id: 'manga', name: 'Manga ink', cw: 8, ch: 12, font: 10.5, help: '#1a1818',
+      bg: hex('#f1ece1'), ink: hex('#141212'), red: hex('#141212'), hot: hex('#141212'), void: hex('#0d0b0b'), voidGlyph: hex('#4a4444'),
+      tone: true, panel: true, grain: 0.07,
+      impact: { white: [hex('#0d0b0b'), hex('#f1ece1')], red: [hex('#0d0b0b'), hex('#f1ece1')], black: [hex('#f1ece1'), hex('#0d0b0b')] } },
+    { id: 'crimson', name: 'Crimson', cw: 8, ch: 12, font: 10.5, help: '#ff5566',
+      bg: hex('#070203'), ink: hex('#cbbaba'), red: hex('#e3172c'), hot: hex('#fff2ea'), void: hex('#000000'), voidGlyph: hex('#55070e'),
+      glow: true, vignette: 0.55,
+      impact: { white: [hex('#fff2ea'), hex('#070203')], red: [hex('#e3172c'), hex('#070203')], black: [hex('#000000'), hex('#ff2a40')] } },
+    { id: 'crt', name: 'Phosphor', cw: 8, ch: 12, font: 10.5, help: '#5dff8f',
+      bg: hex('#010a04'), ink: hex('#2bd35e'), red: hex('#86ffa6'), hot: hex('#e8ffec'), void: hex('#000000'), voidGlyph: hex('#0d4a1e'),
+      glow: true, crt: true, vignette: 0.7,
+      impact: { white: [hex('#c8ffd2'), hex('#010a04')], red: [hex('#2bd35e'), hex('#010a04')], black: [hex('#000000'), hex('#86ffa6')] } },
+    { id: 'akatsuki', name: 'Akatsuki', cw: 9, ch: 13, font: 10.5, help: '#ff5a6a',
+      bg: hex('#0b0a0e'), ink: hex('#ece6dc'), red: hex('#c8102e'), hot: hex('#ffffff'), void: hex('#000000'), voidGlyph: hex('#5c0a16'),
+      tiles: true, clouds: true,
+      impact: { white: [hex('#ffffff'), hex('#0b0a0e')], red: [hex('#c8102e'), hex('#0b0a0e')], black: [hex('#000000'), hex('#c8102e')] } },
+  ];
+
+  // ---------- state ----------
+  let W = 0, H = 0, dpr = 1, s = 1;
+  let styleIx = clamp((+q.get('style') || 2) - 1, 0, 3);
+  let grid = q.has('grid'), recording = false, paused = false;
+  const clean = q.has('clean'); // ?clean: no HUD labels or hints, for video capture
+  document.body.classList.toggle('clean', clean);
+  const seed0 = +q.get('seed') || 11;
+  let rng = mulberry32(seed0);
+  let simT = 0, fxT = 0, spinA = 0, boltT = -1, fireAcc = 0, fireMax = 0;
+  let holdBeat = q.has('hold'); // H: freeze the cut on this beat, effects keep running
+  let callouts = [];            // technique names shouted on screen
+  const SHOWCASE = [3.2, 7.5, 10.2, 12.6, 17.8]; // with H on, → jumps to the best moment of each beat
+  let rain = [], crows = [], debris = [], rings = [], bolts = [], sparks = [];
+  let fire = null, fw = 0, fh = 0;
+  const FCW = 8, FCH = 12; // fire cells in world px
+  let impact = null, shake = 0, shakeX = 0, shakeY = 0, userSL = null;
+  const gaze = { x: 0, y: 0 };
+  const pointer = { x: 0, y: 0, inside: false, moved: -1e9, down: false, downAt: 0, downX: 0, downY: 0, drawing: false, lastT: 0 };
+  // mouse jutsu
+  let splashes = [], kunais = [], slashes = [], igniters = [], stroke = [];
+  const swipe = { pts: [], last: 0 };
+  const kam = { x: 0, y: 0, s: 0 };                       // Kamui: signed strength, + pulls in, - pushes out
+  const tsu = { on: false, stare: 0, since: 0, flips: [], sign: 0 }; // Tsukuyomi
+
+  function eyeGeo() {
+    const EW = Math.min(0.36 * W, 0.7 * H), EH = EW * 0.42;
+    return { cx: 0.5 * W, cy: 0.46 * H, EW, EH, RI: EH * 0.96 };
+  }
+
+  function reset() {
+    rng = mulberry32(seed0);
+    simT = 0; fxT = 0; spinA = 0; boltT = -1; fireAcc = 0; fireMax = 0; callouts = [];
+    crows = []; debris = []; rings = []; bolts = []; sparks = []; impact = null; shake = 0; userSL = null;
+    splashes = []; kunais = []; slashes = []; igniters = []; kam.s = 0;
+    rain = [];
+    const n = Math.round(W * H / 2400);
+    for (let i = 0; i < n; i++) rain.push({ x: rng() * W, y: rng() * H, v: (650 + rng() * 550) * s, len: 2 + (rng() * 4 | 0), z: rng() });
+    fw = Math.ceil(W / FCW); fh = Math.ceil(H / FCH); fire = new Float32Array(fw * fh);
+    gaze.x = 0; gaze.y = 0;
+  }
+
+  // ---------- effects ----------
+  function hit(k, d, sh) { impact = { k, until: fxT + d }; shake = Math.max(shake, sh * s); }
+  function shout(text, kanji, x, y) { callouts.push({ text, kanji, x, y, t: fxT }); if (callouts.length > 4) callouts.shift(); }
+
+  function spawnCrows(x, y, R) { // they burst out of the iris rim, so the new pattern stays readable
+    sfx.crows();
+    for (let i = 0; i < 260; i++) {
+      const a = rng() * TAU, v = (420 + rng() * 900) * s, r0 = R * (1 + rng() * 0.15);
+      crows.push({ x: x + Math.cos(a) * r0, y: y + Math.sin(a) * r0 * 0.8, vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.75 - 120 * s,
+        age: 0, life: 1.6 + rng() * 1.2, flap: rng() * 4, fr: 10 + rng() * 9, big: rng() < 0.7 });
+    }
+  }
+
+  function boom(x, y, p) {
+    hit('white', 0.11 + 0.07 * p, (10 + 16 * p)); sfx.boom(p);
+    rings.push({ x, y, t: fxT, speed: 1500 * s, life: 0.9 }, { x, y, t: fxT + 0.08, speed: 1100 * s, life: 0.8 });
+    const glyphs = '#%&@=+*xX';
+    for (let i = 0, n = Math.round(120 + 280 * p); i < n; i++) {
+      const a = rng() * TAU, v = (300 + rng() * 1200) * s * Math.max(0.45, p);
+      debris.push({ x: x + Math.cos(a) * 18 * s, y: y + Math.sin(a) * 18 * s, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 260 * s,
+        age: 0, life: 1.2 + rng() * 1.3, g: C(glyphs[rng() * glyphs.length | 0]), spin: rng() < 0.4 ? 6 + rng() * 10 : 0, hot: rng() < 0.3 });
+    }
+  }
+
+  // scripted Chidori: charges low in frame, then dashes into the eye; or the user's, held at the pointer
+  function chidori(t) {
+    if (pointer.down && !pointer.drawing && !recording) {
+      const hold = (performance.now() - pointer.downAt) / 1000;
+      if (hold > 0.22) return { on: true, x: pointer.x, y: pointer.y, charge: Math.min(1, (hold - 0.22) / 1.3) };
+    }
+    if (t < 11 || t >= 13.5) return { on: false };
+    const g = eyeGeo(), dash = smooth(13, 13.5, t), e = easeIn(dash);
+    return { on: true, x: g.cx, y: 0.8 * H + (g.cy - 0.8 * H) * e, charge: smooth(11, 12.8, t) };
+  }
+
+  function bolt(segs, x0, y0, x1, y1, depth, disp, inten) { // midpoint-displaced lightning with side branches
+    if (!depth) { segs.push(x0, y0, x1, y1, inten); return; }
+    const mx = (x0 + x1) / 2 + (rng() - 0.5) * disp, my = (y0 + y1) / 2 + (rng() - 0.5) * disp;
+    bolt(segs, x0, y0, mx, my, depth - 1, disp / 2, inten); bolt(segs, mx, my, x1, y1, depth - 1, disp / 2, inten);
+    if (depth >= 3 && rng() < 0.4) {
+      const a = Math.atan2(y1 - y0, x1 - x0) + (rng() - 0.5) * 1.8, l = Math.hypot(x1 - x0, y1 - y0) * 0.5;
+      bolt(segs, mx, my, mx + Math.cos(a) * l, my + Math.sin(a) * l, depth - 2, disp / 2, inten * 0.7);
+    }
+  }
+
+  // ---------- mouse jutsu ----------
+  function splash(x, y) { for (let i = 0; i < 3; i++) splashes.push({ x, y, vx: (rng() - 0.5) * 320 * s, vy: -(120 + rng() * 200) * s, age: 0 }); }
+
+  function throwKunai(x, y) { // flies in from the far side and sticks where you clicked
+    const ox = x < W / 2 ? W + 60 * s : -60 * s, oy = clamp(y + (rng() - 0.5) * H * 0.7, -40, H + 40);
+    const dx = x - ox, dy = y - oy, d = Math.hypot(dx, dy) || 1, v = 2600 * s;
+    kunais.push({ x: ox, y: oy, tx: x, ty: y, vx: dx / d * v, vy: dy / d * v, ux: dx / d, uy: dy / d, stuck: false, age: 0 });
+    shout('KUNAI', '苦無', x, y); sfx.whoosh(0.6);
+    if (kunais.length > 14) kunais.shift();
+  }
+
+  function doSlash(pts) {
+    slashes.push({ pts, t: fxT, bt: -1, segs: [] }); hit('white', 0.05, 11); sfx.zap();
+    shout('RAIKIRI', '雷切', pts[pts.length - 2], pts[pts.length - 1]);
+  }
+
+  function ignite(x, y, r) { igniters.push({ x, y, r: clamp(r, 40 * s, 220 * s), until: fxT + 2.4 }); hit('red', 0.06, 8); sfx.ignite(); shout('AMATERASU', '天照', x, y - r); }
+
+  function breakFree() { // Kai! the genjutsu shatters
+    tsu.on = false; tsu.stare = 0; tsu.flips = [];
+    const g = eyeGeo(), x = pointer.inside ? pointer.x : g.cx, y = pointer.inside ? pointer.y : g.cy;
+    boom(x, y, 0.8); sfx.shatter(); shout('KAI!', '解', x, y);
+  }
+
+  // a stroke (flat x,y list) is a circle, a straight line, or nothing
+  function analyze(pts) {
+    const n = pts.length / 2;
+    if (n < 2) return null;
+    let len = 0, x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, turn = 0, pa = null;
+    for (let i = 0; i < n; i++) {
+      const x = pts[i * 2], y = pts[i * 2 + 1];
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+      if (i) {
+        const dx = x - pts[i * 2 - 2], dy = y - pts[i * 2 - 1], l = Math.hypot(dx, dy);
+        len += l;
+        if (l > 3) { const a = Math.atan2(dy, dx); if (pa !== null) turn += wrapPi(a - pa); pa = a; }
+      }
+    }
+    const size = Math.max(x1 - x0, y1 - y0), close = Math.hypot(pts[0] - pts[n * 2 - 2], pts[1] - pts[n * 2 - 1]);
+    if (n >= 8 && size > 50 * s && close < 0.45 * size && Math.abs(turn) > 1.5 * Math.PI && len > 2.2 * size)
+      return { kind: 'circle', x: (x0 + x1) / 2, y: (y0 + y1) / 2, r: size / 2 };
+    if (len > 120 * s && close / len > 0.75) return { kind: 'line' };
+    return null;
+  }
+  // a slash needs a real stroke: several samples, some distance, mostly straight (a single flick to a spot isn't one)
+  function endSwipe() { const pts = swipe.pts; swipe.pts = []; const r = pts.length >= 10 && analyze(pts); if (r && r.kind === 'line' && Math.hypot(pts[0] - pts[pts.length - 2], pts[1] - pts[pts.length - 1]) > 220 * s) doSlash(pts); }
+
+  function updateTsukuyomi(dt) { // real time, not the slowed sim clock
+    if (recording) { tsu.on = false; tsu.stare = 0; return; }
+    if (tsu.on) { if (performance.now() - tsu.since > 12000) breakFree(); return; }
+    const g = eyeGeo(), ix = g.cx + gaze.x * g.EW * 0.28, iy = g.cy + gaze.y * g.EH * 0.22;
+    const over = pointer.inside && !pointer.down && aperture(simT) > 0.9 && Math.hypot(pointer.x - ix, pointer.y - iy) < g.RI * 0.9; // any time the eye is open
+    tsu.stare = over ? tsu.stare + dt : Math.max(0, tsu.stare - dt * 2);
+    if (tsu.stare >= 1.5) { tsu.on = true; tsu.since = performance.now(); tsu.stare = 0; tsu.flips = []; hit('red', 0.12, 12); sfx.genjutsu(); shout('TSUKUYOMI', '月読', W / 2, H * 0.2); }
+  }
+
+  function makeBolts(x, y, c) {
+    const segs = [], R = (50 + 190 * c) * s, n = 6 + Math.round(8 * c);
+    for (let i = 0; i < n; i++) { const a = rng() * TAU, len = R * (0.5 + rng() * 0.7); bolt(segs, x, y, x + Math.cos(a) * len, y + Math.sin(a) * len, 4, len * 0.34, 1); }
+    sparks = [];
+    for (let i = 0; i < 10 + 20 * c; i++) { const a = rng() * TAU, r = R * (0.3 + rng() * 0.9); sparks.push(x + Math.cos(a) * r, y + Math.sin(a) * r); }
+    return segs;
+  }
+
+  // Amaterasu: a doom-fire heat field whose flames grow until they swallow the frame
+  function stepFire(dt, t) {
+    fireAcc += dt;
+    while (fireAcc >= 1 / 30) {
+      fireAcc -= 1 / 30;
+      const on = t >= 16 && t < T_FIRE_OFF;
+      const decay = on ? 0.09 + (0.026 - 0.09) * smooth(16, 18.2, t) : igniters.length ? 0.07 : 0.14;
+      const base = (fh - 1) * fw;
+      for (let x = 0; x < fw; x++) fire[base + x] = on ? (0.6 + 0.4 * rng()) * (0.5 + 0.5 * Math.sin(x * 0.27 + t * 2.1) ** 2) : 0;
+      for (const ig of igniters) { // Amaterasu where you drew the circle
+        const cx = ig.x / FCW, cy = ig.y / FCH, rx = ig.r / FCW, ry = ig.r / FCH;
+        for (let y = Math.max(0, cy - ry | 0); y < Math.min(fh, cy + ry + 1); y++) for (let x = Math.max(0, cx - rx | 0); x < Math.min(fw, cx + rx + 1); x++) {
+          if (((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 < 1) fire[y * fw + x] = Math.max(fire[y * fw + x], 0.7 + 0.3 * rng());
+        }
+      }
+      let mx = 0;
+      for (let y = 1; y < fh; y++) for (let x = 0; x < fw; x++) {
+        const r = rng(), dst = (y - 1) * fw + clamp(x + ((r * 3) | 0) - 1, 0, fw - 1);
+        const v = Math.max(0, fire[y * fw + x] - r * decay);
+        fire[dst] = v; if (v > mx) mx = v;
+      }
+      if (pointer.inside && !recording) { // the pointer parts the flames
+        const pcx = pointer.x / FCW | 0, pcy = pointer.y / FCH | 0;
+        for (let y = Math.max(0, pcy - 6); y < Math.min(fh, pcy + 7); y++) for (let x = Math.max(0, pcx - 9); x < Math.min(fw, pcx + 10); x++) {
+          if (Math.hypot((x - pcx) * FCW, (y - pcy) * FCH) < 70 * s) fire[y * fw + x] *= 0.5;
+        }
+      }
+      fireMax = mx;
+    }
+  }
+
+  function step(dt) {
+    const t0 = simT;
+    fxT += dt;
+    if (!holdBeat) simT += dt;
+    if (simT >= LOOP) { simT -= LOOP; crows = []; debris = []; bolts = []; fire.fill(0); fireMax = 0; spinA = 0; }
+    const t = simT, ft = fxT, wrapped = t < t0;
+    const crossed = x => wrapped ? (x > t0 || x <= t) : (t0 < x && t >= x);
+    for (const im of IMPACTS) if (crossed(im.t)) { hit(im.k, im.d, im.s); sfx.cue(im.snd); }
+    if (crossed(13)) sfx.whoosh(1.4); // the dash
+    const g = eyeGeo();
+    if (crossed(9.3)) spawnCrows(g.cx, g.cy, g.RI);
+    if (crossed(13.5)) { boom(g.cx, g.cy, 1); userSL = null; }
+
+    const w = t < 7 ? 0 : t < 8 ? 0.9 : t < 9.3 ? 0.9 + 27 * easeIn((t - 8) / 1.3) : 0.35;
+    spinA += w * dt;
+
+    const rs = rainSpeed(t), umb = pointer.inside && !recording, UR = 70 * s, KR = 0.3 * Math.min(W, H);
+    // Kamui pulls particles into a spiral around the scroll point (or flings them out)
+    const kamui = (p, moving) => {
+      const dx = kam.x - p.x, dy = kam.y - p.y, d = Math.hypot(dx, dy);
+      if (d > KR || d < 1) return d;
+      const f = kam.s * (1 - d / KR);
+      if (moving) { p.vx += (dx / d * 2400 - dy / d * 1500) * s * f * dt; p.vy += (dy / d * 2400 + dx / d * 1500) * s * f * dt; }
+      else { p.x += (dx * 2.2 - dy * 1.6) * f * dt; p.y += (dy * 2.2 + dx * 1.6) * f * dt; }
+      return d;
+    };
+    for (const d of rain) {
+      d.y += d.v * rs * dt;
+      if (umb) { // the cursor is an umbrella: drops hitting its top half splash
+        const dx = d.x - pointer.x, dy = d.y - pointer.y;
+        if (dy < 0 && dy > -UR && Math.abs(dx) < UR * Math.sqrt(1 - (dy / UR) ** 2)) { if (splashes.length < 450) splash(d.x, d.y); d.y = -rng() * 60; d.x = rng() * W; continue; }
+      }
+      if (kam.s && kamui(d, false) < 12 * s && kam.s > 0) { d.y = -rng() * 60; d.x = rng() * W; continue; }
+      if (d.y > H + d.len * 14) { d.y = -rng() * 60; d.x = rng() * W; }
+    }
+    for (const p of splashes) { p.vy += 900 * s * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.age += dt; if (kam.s) kamui(p, true); }
+    splashes = splashes.filter(p => p.age < 0.38);
+    if (kam.s) { for (const c of crows) kamui(c, true); for (const p of debris) kamui(p, true); }
+    kam.s *= Math.exp(-dt * 0.8); if (Math.abs(kam.s) < 0.02) kam.s = 0;
+
+    for (const k of kunais) {
+      k.age += dt;
+      if (k.stuck) continue;
+      k.x += k.vx * dt; k.y += k.vy * dt;
+      if ((k.tx - k.x) * k.vx + (k.ty - k.y) * k.vy <= 0) { // thunk
+        k.x = k.tx; k.y = k.ty; k.stuck = true; k.age = 0; sfx.thunk();
+        rings.push({ x: k.x, y: k.y, t: fxT, speed: 380 * s, life: 0.35 }); shake = Math.max(shake, 3 * s);
+        for (let i = 0; i < 6; i++) { const a = rng() * TAU, v = (150 + rng() * 250) * s; debris.push({ x: k.x, y: k.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 120 * s, age: 0, life: 0.5 + rng() * 0.4, g: C('.'), spin: 0, hot: false }); }
+      }
+    }
+    kunais = kunais.filter(k => !k.stuck || k.age < 3);
+    for (const sl of slashes) if (ft - sl.bt > 0.05) { // lightning re-crackles along the cut
+      sl.segs = []; sl.bt = ft;
+      for (let i = 0; i + 3 < sl.pts.length; i += 2) bolt(sl.segs, sl.pts[i], sl.pts[i + 1], sl.pts[i + 2], sl.pts[i + 3], 3, Math.hypot(sl.pts[i + 2] - sl.pts[i], sl.pts[i + 3] - sl.pts[i + 1]) * 0.3 + 6 * s, 1);
+    }
+    slashes = slashes.filter(sl => ft - sl.t < 0.6);
+    igniters = igniters.filter(ig => ft < ig.until);
+    callouts = callouts.filter(c => ft - c.t < 1.2);
+    for (const c of crows) { c.vx *= 0.986; c.vy = c.vy * 0.986 - 70 * s * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.age += dt; c.flap += dt * c.fr; }
+    crows = crows.filter(c => c.age < c.life);
+    for (const p of debris) { p.vy += 900 * s * dt; p.vx *= 0.99; p.x += p.vx * dt; p.y += p.vy * dt; p.age += dt; }
+    debris = debris.filter(p => p.age < p.life);
+    rings = rings.filter(r => ft - r.t < r.life);
+
+    const ch = chidori(t);
+    if (ch.on) { if (ft - boltT > 0.06) { bolts = makeBolts(ch.x, ch.y, ch.charge); boltT = ft; } bolts.c = ch; }
+    else bolts = [];
+    stepFire(dt, t);
+
+    // where the eye looks: at you while you move, otherwise it follows the action
+    let tx, ty;
+    if (!recording && performance.now() - pointer.moved < 2500) { tx = clamp((pointer.x - g.cx) / g.EW, -1, 1); ty = clamp((pointer.y - g.cy) / g.EH, -1, 1); }
+    else if (t < 8) { tx = 0.5 * Math.sin(t * 0.9); ty = 0.2 * Math.sin(t * 0.6); }
+    else if (t >= 11 && t < 13.2) { tx = 0; ty = 0.9; }
+    else { tx = 0; ty = 0; }
+    const k = Math.min(1, dt * 7);
+    gaze.x += (tx - gaze.x) * k; gaze.y += (ty - gaze.y) * k;
+
+    shake *= Math.exp(-dt * 6);
+    shakeX = (rng() - 0.5) * 2 * shake; shakeY = (rng() - 0.5) * 2 * shake;
+  }
+
+  // ---------- the eye's pattern: tomoe that pop in and spin up, then Itachi's pinwheel ----------
+  function patternAt(dx, dy, d, RI, t) {
+    const rn = d / RI, phi = Math.atan2(dy, dx);
+    if (mangekyo(t)) {
+      if (rn < 0.27) return 1;
+      if (rn > 0.9) return 0;
+      for (let k = 0; k < 3; k++) {
+        const psi = spinA + k * TAU / 3 + 1.15 * rn ** 1.5;
+        if (Math.abs(wrapPi(phi - psi)) < 0.62 * (1 - rn) ** 0.75 + 0.03) return 1;
+      }
+      return 0;
+    }
+    let v = rn < 0.17 ? 1 : 0;
+    if (t < TOMOE_AT[0]) return v;
+    if (Math.abs(rn - 0.56) < 0.022) v = Math.max(v, 0.7);
+    const smearN = t > 8.3 && t < 9.3 ? 6 : 1, RR = 0.56 * RI;
+    for (let j = 0; j < smearN; j++) {
+      const fade = 1 - j / smearN, base = spinA - j * 0.16;
+      for (let k = 0; k < 3; k++) {
+        const x = (t - TOMOE_AT[k]) / 0.25;
+        if (x <= 0) continue;
+        const sc = easeOutBack(Math.min(1, x)), a = base + k * TAU / 3, rt = 0.15 * RI * sc;
+        if (Math.hypot(dx - Math.cos(a) * RR, dy - Math.sin(a) * RR) < rt) { v = Math.max(v, fade); continue; }
+        const back = wrap(a - phi), TL = 0.9 * sc; // the tail trails behind the head
+        if (back < TL) { const u = back / TL; if (Math.abs(d - (RR + rt * 0.9 * u)) < rt * 0.85 * (1 - u) ** 1.3) v = Math.max(v, fade); }
+      }
+    }
+    return v;
+  }
+
+  // ---------- compose: every effect writes glyph + role + strength into one cell buffer ----------
+  const buffers = {};
+  function buffer(vid, cols, rows) {
+    let B = buffers[vid];
+    if (!B || B.cols !== cols || B.rows !== rows) B = buffers[vid] = { cols, rows, gch: new Uint8Array(cols * rows), role: new Uint8Array(cols * rows), val: new Float32Array(cols * rows) };
+    return B;
+  }
+
+  function compose(st, scale, B) {
+    const cw = st.cw, ch = st.ch, cols = B.cols, rows = B.rows, inv = 1 / scale, t = simT, ft = fxT, fq = Math.floor(ft * 30);
+    const { gch, role, val } = B;
+    val.fill(0);
+    const put = (c, r, code, ro, v, force) => {
+      if (c < 0 || r < 0 || c >= cols || r >= rows) return;
+      const k = r * cols + c;
+      if (force || v >= val[k]) { gch[k] = code; role[k] = ro; val[k] = v; }
+    };
+    const cellOf = (x, y) => [Math.floor(x * scale / cw), Math.floor(y * scale / ch)];
+
+    // rain
+    for (const d of rain) {
+      const [c, r] = cellOf(d.x, d.y), a = 0.22 + 0.35 * d.z;
+      put(c, r, C(rainSpeed(t) < 0.05 ? "'" : ','), R_INK, a + 0.1);
+      for (let j = 1; j < d.len; j++) put(c, r - j, C('|'), R_INK, a * (1 - j / d.len * 0.7));
+    }
+
+    // Amaterasu: black body, red rim, embers
+    if (fireMax > 0.05) {
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const fx = Math.min(fw - 1, ((c + 0.5) * cw * inv / FCW) | 0), fy = Math.min(fh - 1, ((r + 0.5) * ch * inv / FCH) | 0);
+        const h = fire[fy * fw + fx];
+        if (h < 0.06) continue;
+        // black core, red tongues licking through it, embers at the edge
+        const lick = Math.sin(r * 0.9 - t * 9 + c * 0.35 + Math.sin(c * 0.21 + t * 2) * 2) > 0.55;
+        if (h > 0.5 && !lick) put(c, r, C(RAMP[clamp(Math.round(h * 9), 6, 9)]), R_VOID, 0.6 + 0.4 * h, true);
+        else if (h > 0.22) put(c, r, C(h > 0.4 ? '#' : h > 0.3 ? '*' : '+'), R_RED, Math.min(1, 0.35 + h), true);
+        else put(c, r, C(h > 0.13 ? ':' : '.'), R_RED, h * 3, false);
+      }
+    }
+
+    // the eye
+    const g = eyeGeo(), ap = aperture(t), eA = eyeAlpha(t);
+    if (t >= 1 && t < LOOP - 0.1) {
+      const lw = ch * inv, gx = gaze.x * g.EW * 0.28, gy = gaze.y * g.EH * 0.22, RI = g.RI, red = irisRed(t);
+      const [c0, r0] = cellOf(g.cx - g.EW * 1.06, g.cy - g.EH - 3 * lw), [c1, r1] = cellOf(g.cx + g.EW * 1.06, g.cy + g.EH + 3 * lw);
+      for (let r = Math.max(0, r0); r <= Math.min(rows - 1, r1); r++) for (let c = Math.max(0, c0); c <= Math.min(cols - 1, c1); c++) {
+        const x = (c + 0.5) * cw * inv - g.cx, y = (r + 0.5) * ch * inv - g.cy, ux = x / g.EW;
+        if (Math.abs(ux) > 1.05) continue;
+        const f = Math.max(0, 1 - ux * ux);
+        if (ap < 0.06) { // closed: a single lash line
+          if (Math.abs(y - 0.25 * g.EH * f) < lw * 0.6 && f > 0) put(c, r, C('='), R_INK, 0.55 * (t > T_CLOSE ? 1 : smooth(1, 1.8, t)), true);
+          continue;
+        }
+        const yu = -g.EH * ap * f ** 0.85 * (1 + 0.12 * ux), yl = g.EH * ap * 0.82 * f ** 1.05;
+        if (Math.abs(y - yu) < lw * 0.85) { put(c, r, C(Math.abs(ux) > 0.9 ? (ux > 0 ? '\\' : '/') : '#'), R_INK, 0.95 * eA, true); continue; }
+        if (y < yu && y > yu - lw * 1.9 && Math.abs(ux) < 0.92) { put(c, r, C('='), R_INK, 0.6 * eA, true); continue; }
+        if (Math.abs(y - yl) < lw * 0.55) { put(c, r, C('-'), R_INK, 0.55 * eA, true); continue; }
+        if (y <= yu || y >= yl) continue;
+        const dx = x - gx, dy = y - gy, d = Math.hypot(dx, dy);
+        if (Math.hypot(dx + RI * 0.38, dy + RI * 0.36) < RI * 0.11) { put(c, r, C('@'), R_HOT, eA, true); continue; } // glint
+        if (d < RI) {
+          const rn = d / RI;
+          if (rn > 0.92) { put(c, r, C('@'), R_VOID, eA, true); continue; }
+          const pv = patternAt(dx, dy, d, RI, t);
+          if (pv > 0.5) { put(c, r, C(pv > 0.85 ? '#' : '%'), R_VOID, eA * pv, true); continue; }
+          const streak = hash2(Math.floor((Math.atan2(dy, dx) + Math.PI) / 0.09), Math.floor(rn * 6)) % 3;
+          const v = (0.45 + 0.5 * rn) * eA;
+          put(c, r, C(RAMP[clamp(Math.round(v * 9) + streak - 1, 1, 9)]), red ? R_RED : R_INK, red ? v : v * 0.55, true);
+        } else {
+          const shade = y < yu + (yl - yu) * 0.22 ? 0.22 : 0.1;
+          if (shade > 0.2 || hash2(c, r) % 4 === 0) put(c, r, C(shade > 0.2 ? ':' : '.'), R_INK, shade * eA, true);
+        }
+      }
+    }
+
+    // speed lines converge on the strike
+    const sl = t >= 13 && t < 13.62 ? { x: g.cx, y: g.cy, k: smooth(13, 13.2, t), p: smooth(13, 13.5, t) }
+      : userSL && ft - userSL.t < 0.35 ? { x: userSL.x, y: userSL.y, k: 1, p: (ft - userSL.t) / 0.35 } : null;
+    if (sl) {
+      const N = 96, minR = 0.2 * Math.min(W, H) * (1 - 0.55 * sl.p);
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const dx = (c + 0.5) * cw * inv - sl.x, dy = (r + 0.5) * ch * inv - sl.y, rr = Math.hypot(dx, dy);
+        if (rr < minR) continue;
+        const a = Math.atan2(dy, dx), ki = Math.round(a / (TAU / N));
+        if (Math.abs(a - ki * TAU / N) * rr > 0.6 * cw * inv || hash2(ki, fq) % 5 < 2) continue;
+        put(c, r, dirCode(dx, dy), R_INK, 0.6 * sl.k, false);
+      }
+    }
+
+    // crows
+    for (const cr of crows) {
+      const [c, r] = cellOf(cr.x, cr.y), a = (1 - cr.age / cr.life) * 0.95, ph = Math.floor(cr.flap) & 3;
+      if (cr.big) {
+        const L = ph === 0 ? '\\' : ph === 2 ? '/' : '-', R = ph === 0 ? '/' : ph === 2 ? '\\' : '-';
+        put(c - 1, r, C(L), R_INK, a, true); put(c, r, C(ph === 2 ? '^' : 'v'), R_INK, a, true); put(c + 1, r, C(R), R_INK, a, true);
+      } else put(c, r, C('v-^-'[ph]), R_INK, a, true);
+    }
+
+    // lightning: white-hot core, red glow, a crackling ball and sparks
+    if (bolts.length) {
+      const segs = bolts, step = 0.5 * cw * inv;
+      for (let i = 0; i < segs.length; i += 5) {
+        const x0 = segs[i], y0 = segs[i + 1], x1 = segs[i + 2], y1 = segs[i + 3], it = segs[i + 4];
+        const code = dirCode(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / step));
+        for (let j = 0; j <= n; j++) {
+          const [c, r] = cellOf(x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n);
+          put(c, r, code, R_HOT, it, true);
+          put(c - 1, r, C(':'), R_RED, 0.35 * it, false); put(c + 1, r, C(':'), R_RED, 0.35 * it, false);
+        }
+      }
+      const b = bolts.c, rb = (14 + 40 * b.charge) * s, [bc, br] = cellOf(b.x, b.y), rc = Math.ceil(rb * scale / cw) + 1, rrw = Math.ceil(rb * scale / ch) + 1;
+      for (let r = br - rrw; r <= br + rrw; r++) for (let c = bc - rc; c <= bc + rc; c++) {
+        const d = Math.hypot((c + 0.5) * cw * inv - b.x, (r + 0.5) * ch * inv - b.y);
+        if (d < rb) put(c, r, C(hash2(c, r + fq) % 3 ? '@' : '#'), R_HOT, 1, true);
+      }
+      for (let i = 0; i < sparks.length; i += 2) { const [c, r] = cellOf(sparks[i], sparks[i + 1]); put(c, r, C(hash2(i, fq) & 1 ? '*' : '+'), R_HOT, 0.8, true); }
+    }
+
+    // shockwave rings
+    for (const rg of rings) {
+      const age = ft - rg.t;
+      if (age < 0) continue;
+      const R = age * rg.speed, band = 1.1 * ch * inv, a = 1 - age / rg.life;
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const d = Math.hypot((c + 0.5) * cw * inv - rg.x, (r + 0.5) * ch * inv - rg.y);
+        if (Math.abs(d - R) < band) put(c, r, C(Math.abs(d - R) < band * 0.45 ? '@' : '#'), R_HOT, a, true);
+        else if (d < R && d > R - band * 3 && hash2(c, r + fq) % 3 === 0) put(c, r, C('+'), R_RED, a * 0.6, false);
+      }
+    }
+
+    // debris
+    for (const p of debris) {
+      const [c, r] = cellOf(p.x, p.y), a = 1 - p.age / p.life;
+      put(c, r, p.spin ? DIRS[Math.floor(p.age * p.spin) & 3] : p.g, p.hot ? R_HOT : R_INK, a, true);
+    }
+
+    // rain splashing off the cursor
+    for (const p of splashes) { const [c, r] = cellOf(p.x, p.y); put(c, r, C(p.age < 0.1 ? '*' : p.age < 0.2 ? "'" : '.'), p.age < 0.1 ? R_HOT : R_INK, 0.95 * (1 - p.age / 0.38), true); }
+
+    // kunai: blade, guard, wrapped handle, ring; a motion trail while it flies
+    for (const kn of kunais) {
+      const a = kn.stuck ? clamp(1 - (kn.age - 2.4) / 0.6, 0, 1) : 1, stepW = Math.max(cw, ch) * 0.75 * inv, hc = dirCode(kn.ux, kn.uy);
+      const tip = Math.abs(kn.ux) > 0.7 ? (kn.ux > 0 ? '>' : '<') : Math.abs(kn.uy) > 0.7 ? (kn.uy > 0 ? 'v' : '^') : (kn.ux * kn.uy > 0 ? '\\' : '/');
+      const parts = [C(tip), C('#'), C('+'), hc, hc, C('o')];
+      for (let j = 0; j < parts.length; j++) { const [c, r] = cellOf(kn.x - kn.ux * stepW * j, kn.y - kn.uy * stepW * j); put(c, r, parts[j], j < 2 ? R_HOT : R_INK, a, true); }
+      if (!kn.stuck) for (let j = 6; j < 12; j++) { const [c, r] = cellOf(kn.x - kn.ux * stepW * j, kn.y - kn.uy * stepW * j); put(c, r, hc, R_INK, 0.5 * (1 - (j - 6) / 6), false); }
+    }
+
+    // Chidori slash: a black tear with white-hot lips that open, lightning crackling along it
+    for (const sl of slashes) {
+      const age = ft - sl.t, a = 1 - age / 0.6, P = sl.pts;
+      for (let i = 0; i + 3 < P.length; i += 2) {
+        const x0 = P[i], y0 = P[i + 1], x1 = P[i + 2], y1 = P[i + 3], code = dirCode(x1 - x0, y1 - y0);
+        const nl = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / nl, ny = (x1 - x0) / nl, off = ch * inv * (0.7 + age * 3);
+        for (let j = 0, n = Math.max(1, Math.ceil(nl / (0.5 * cw * inv))); j <= n; j++) {
+          const x = x0 + (x1 - x0) * j / n, y = y0 + (y1 - y0) * j / n;
+          let [c, r] = cellOf(x, y); put(c, r, C('='), R_VOID, a, true);
+          [c, r] = cellOf(x + nx * off, y + ny * off); put(c, r, code, R_HOT, a, true);
+          [c, r] = cellOf(x - nx * off, y - ny * off); put(c, r, code, R_HOT, a, true);
+        }
+      }
+      const segs = sl.segs, stp = 0.5 * cw * inv;
+      for (let i = 0; i < segs.length; i += 5) {
+        const x0 = segs[i], y0 = segs[i + 1], x1 = segs[i + 2], y1 = segs[i + 3], code = dirCode(x1 - x0, y1 - y0);
+        for (let j = 0, n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / stp)); j <= n; j++) { const [c, r] = cellOf(x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n); put(c, r, code, R_HOT, a, false); }
+      }
+    }
+
+    // the circle you're drawing, as a trail of embers
+    if (pointer.down && pointer.drawing) for (let i = 0; i < stroke.length; i += 2) { const [c, r] = cellOf(stroke[i], stroke[i + 1]); put(c, r, C('*'), R_RED, 0.85, true); }
+
+    // staring into the eye: a ring closes in around the cursor
+    if (tsu.stare > 0.05 && !tsu.on) {
+      const p = tsu.stare / 1.5, R = (1 - p) * 80 * s + 14 * s;
+      for (let i = 0; i < 32; i++) { const a = i / 32 * TAU + ft * 2, [c, r] = cellOf(pointer.x + Math.cos(a) * R, pointer.y + Math.sin(a) * R); put(c, r, C(i % 4 ? '.' : '+'), R_RED, 0.4 + 0.6 * p, true); }
+    }
+
+    // Kamui: twist and pull the composed frame around the scroll point, with spiral arms and a void at the centre
+    if (kam.s) {
+      if (!B.tg) { B.tg = new Uint8Array(gch.length); B.tr = new Uint8Array(gch.length); B.tv = new Float32Array(gch.length); }
+      B.tg.set(gch); B.tr.set(role); B.tv.set(val);
+      const R = 0.3 * Math.min(W, H) * scale, kx = kam.x * scale, ky = kam.y * scale, sg = Math.sign(kam.s), mag = Math.min(1, Math.abs(kam.s));
+      const c0 = Math.max(0, Math.floor((kx - R) / cw)), c1 = Math.min(cols - 1, Math.ceil((kx + R) / cw));
+      const r0 = Math.max(0, Math.floor((ky - R) / ch)), r1 = Math.min(rows - 1, Math.ceil((ky + R) / ch));
+      for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+        const px = (c + 0.5) * cw - kx, py = (r + 0.5) * ch - ky, d = Math.hypot(px, py);
+        if (d >= R) continue;
+        const f = (1 - d / R) ** 2, ang = Math.atan2(py, px), k = r * cols + c;
+        const a = ang - kam.s * 3 * f, sd = d * (1 + kam.s * 0.7 * f);
+        const sc = Math.floor((kx + Math.cos(a) * sd) / cw), sr = Math.floor((ky + Math.sin(a) * sd) / ch);
+        if (sc >= 0 && sr >= 0 && sc < cols && sr < rows) { const sk = sr * cols + sc; gch[k] = B.tg[sk]; role[k] = B.tr[sk]; val[k] = B.tv[sk]; } else val[k] = 0;
+        if (d < R * 0.08 * mag + 2) { gch[k] = C('@'); role[k] = R_VOID; val[k] = 1; continue; }
+        if (Math.sin(3 * ang - sg * (d / R) * 10 + sg * ft * 5) > 0.9 && f > 0.03) put(c, r, C(f > 0.3 ? '%' : '+'), R_RED, Math.min(1, mag * f * 2.5 + 0.2), true);
+      }
+    }
+  }
+
+  // ---------- backdrops & overlays, baked once per size ----------
+  const baked = new Map();
+  function bake(key, vw, vh, draw) {
+    let cv = baked.get(key);
+    if (cv) return cv;
+    cv = document.createElement('canvas'); cv.width = Math.max(1, Math.round(vw * dpr)); cv.height = Math.max(1, Math.round(vh * dpr));
+    const g = cv.getContext('2d'); g.scale(dpr, dpr); draw(g); baked.set(key, cv);
+    return cv;
+  }
+  function backdrop(st, vw, vh) {
+    return bake(`bg:${st.id}:${vw}x${vh}@${dpr}`, vw, vh, g => {
+      g.fillStyle = rgba(st.bg, 1); g.fillRect(0, 0, vw, vh);
+      if (st.clouds) { // Akatsuki clouds: red fill, white rim, all in cells
+        const cw = st.cw, ch = st.ch, cols = Math.ceil(vw / cw), rows = Math.ceil(vh / ch);
+        const cloud = (cx, cy, R) => [[0, 0, 1], [-0.95, 0.15, 0.7], [0.95, 0.12, 0.72], [-0.45, -0.45, 0.62], [0.5, -0.42, 0.6]].map(([x, y, r]) => [cx + x * R, cy + y * R, r * R]);
+        const set = [cloud(0.12, 0.2, 0.07), cloud(0.86, 0.16, 0.06), cloud(0.08, 0.78, 0.06), cloud(0.9, 0.82, 0.075), cloud(0.6, 0.93, 0.05)]
+          .map(cl => cl.map(([x, y, r]) => [x * vw, y * vh, r * vw]));
+        g.font = `${st.font}px ${MONO}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+        for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+          const x = (c + 0.5) * cw, y = (r + 0.5) * ch;
+          for (const cl of set) {
+            let m = -1e9;
+            for (const [bx, by, br] of cl) m = Math.max(m, br - Math.hypot(x - bx, (y - by) * 1.25));
+            if (m < 0) continue;
+            const rim = m < cw * 1.1;
+            g.fillStyle = rgba(st.red, rim ? 0.0 : 0.2); g.fillRect(c * cw + 1, r * ch + 1, cw - 1, ch - 1);
+            g.fillStyle = rim ? rgba(st.ink, 0.42) : rgba(st.red, 0.35); g.fillText(rim ? '#' : '~', x, y + 1);
+            break;
+          }
+        }
+      }
+      if (st.grain) {
+        const img = g.getImageData(0, 0, Math.round(vw * dpr), Math.round(vh * dpr)), d = img.data, r = mulberry32(5), amt = st.grain * 255;
+        for (let i = 0; i < d.length; i += 4) { const n = (r() - 0.5) * amt; d[i] += n; d[i + 1] += n; d[i + 2] += n; }
+        g.putImageData(img, 0, 0);
+      }
+    });
+  }
+  function overlay(st, vw, vh) {
+    return bake(`ov:${st.id}:${vw}x${vh}@${dpr}`, vw, vh, g => {
+      if (st.crt) { g.fillStyle = 'rgba(0,0,0,0.28)'; for (let y = 0; y < vh; y += 3) g.fillRect(0, y, vw, 1); }
+      if (st.vignette) {
+        const v = g.createRadialGradient(vw / 2, vh / 2, Math.min(vw, vh) * 0.35, vw / 2, vh / 2, Math.hypot(vw, vh) * 0.6);
+        v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(0,0,0,${st.vignette})`);
+        g.fillStyle = v; g.fillRect(0, 0, vw, vh);
+      }
+      if (st.panel) { g.strokeStyle = rgba(st.ink, 1); g.lineWidth = 3; g.strokeRect(14, 14, vw - 28, vh - 28); }
+    });
+  }
+
+  // ---------- render one view in one style ----------
+  const lists = Array.from({ length: 5 * 16 }, () => []);
+  function renderView(st, ox, oy, vw, vh, scale, vid) {
+    const cw = st.cw, ch = st.ch, cols = Math.ceil(vw / cw), rows = Math.ceil(vh / ch);
+    const B = buffer(vid, cols, rows);
+    compose(st, scale, B);
+    const brief = impact && fxT < impact.until ? st.impact[impact.k] : null;
+    const im = brief || (tsu.on ? st.impact.red : null); // Tsukuyomi: the whole world in two colours
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(ox, oy, vw, vh); ctx.clip();
+    if (im) { ctx.fillStyle = rgba(im[0], 1); ctx.fillRect(ox, oy, vw, vh); }
+    else ctx.drawImage(backdrop(st, vw, vh), ox, oy, vw, vh);
+    if (tsu.on && !brief) { // the genjutsu moon
+      const mr = 0.1 * Math.min(vw, vh), mx = ox + vw * 0.8, my = oy + vh * 0.22;
+      ctx.fillStyle = rgba(im[1], 1); ctx.beginPath(); ctx.arc(mx, my, mr, 0, TAU); ctx.fill();
+      ctx.strokeStyle = rgba(im[1], 0.5); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, mr * 1.25, 0, TAU); ctx.stroke();
+    }
+    ctx.translate(ox + shakeX * scale, oy + shakeY * scale);
+    ctx.font = `${st.font}px ${MONO}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+    for (const l of lists) l.length = 0;
+    const { gch, role, val } = B;
+    for (let k = 0; k < cols * rows; k++) { const v = val[k]; if (v > 0.03) lists[role[k] * 16 + Math.min(15, (v * 16) | 0)].push(k); }
+    const X = k => (k % cols) * cw, Y = k => ((k / cols) | 0) * ch;
+    const text = (list, style) => { ctx.fillStyle = style; for (const k of list) ctx.fillText(CHARS[gch[k]], X(k) + cw / 2, Y(k) + ch / 2 + 1); };
+    const rects = (list, style, grow = 0) => { ctx.fillStyle = style; for (const k of list) ctx.fillRect(X(k) + 1 - grow, Y(k) + 1 - grow, cw - 1 + 2 * grow, ch - 1 + 2 * grow); };
+
+    if (im) { // impact frame: everything collapses to two colours
+      for (let ro = 1; ro <= 4; ro++) for (let L = 0; L < 16; L++) {
+        const list = lists[ro * 16 + L]; if (!list.length) continue;
+        if (ro === R_VOID) rects(list, rgba(im[1], 1)); else text(list, rgba(im[1], 0.45 + 0.55 * L / 15));
+      }
+    } else {
+      const col = { [R_INK]: st.ink, [R_RED]: st.red, [R_HOT]: st.hot };
+      if (st.glow) for (const ro of [R_RED, R_HOT]) for (let L = 9; L < 16; L++) { const list = lists[ro * 16 + L]; if (list.length) rects(list, rgba(col[ro], 0.1), 3); }
+      for (let L = 0; L < 16; L++) { const list = lists[R_VOID * 16 + L]; if (!list.length) continue; rects(list, rgba(st.void, 1)); text(list, rgba(st.voidGlyph, 0.5 + 0.5 * L / 15)); }
+      for (const ro of [R_INK, R_RED, R_HOT]) for (let L = 0; L < 16; L++) {
+        const list = lists[ro * 16 + L]; if (!list.length) continue;
+        const a = 0.25 + 0.75 * L / 15;
+        if (st.tiles && L > 2 && (ro !== R_INK || L > 12)) { rects(list, rgba(col[ro], a * 0.85)); text(list, rgba(st.bg, 0.9)); } // rain stays thin
+        else if (st.tone && ro === R_RED) { // manga screentone: the iris becomes a dot pattern
+          ctx.fillStyle = rgba(st.ink, 0.85);
+          const tone = L > 11 ? '%' : L > 7 ? ':' : '.';
+          for (const k of list) { const c = k % cols, r = (k / cols) | 0; if (L > 7 || (c + r) % 2 === 0) ctx.fillText(tone, X(k) + cw / 2, Y(k) + ch / 2 + 1); }
+        } else text(list, rgba(col[ro], a));
+      }
+    }
+    ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(ox, oy, vw, vh); ctx.clip();
+    if (!im) ctx.drawImage(overlay(st, vw, vh), ox, oy, vw, vh);
+    hud(st, ox, oy, vw, vh, im);
+    ctx.restore();
+  }
+
+  const fmt = t => `00:${t.toFixed(1).padStart(4, '0')}`;
+  function hud(st, ox, oy, vw, vh, im) {
+    const beat = BEATS.filter(b => simT >= b[0]).pop(), pad = st.panel ? 30 : 20;
+    if (clean) { drawCallouts(st, ox, oy, vw, vh, im); return; }
+    ctx.font = `11px ${MONO}`; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = im ? rgba(im[1], 0.9) : st.help; ctx.globalAlpha = 0.85;
+    ctx.textAlign = 'left'; ctx.fillText(`写輪眼  ${beat[1]} ${beat[2]}`, ox + pad, oy + pad + 10);
+    ctx.textAlign = 'right'; ctx.fillText(`${holdBeat ? 'HOLD · ' : ''}${fmt(simT)} / ${fmt(LOOP)}`, ox + vw - pad, oy + pad + 10);
+    if (!recording) ctx.fillText(sfx.enabled ? '♪ M' : '♪ OFF · M', ox + vw - pad, oy + pad + 26);
+    ctx.fillText(`UCHIHA · ${st.name.toUpperCase()}`, ox + vw - pad, oy + vh - pad + 4);
+    if (tsu.on) { ctx.textAlign = 'center'; ctx.font = `600 12px ${MONO}`; ctx.fillText('月読  TSUKUYOMI — shake the mouse to break free', ox + vw / 2, oy + vh - pad - 30); }
+    ctx.globalAlpha = 1;
+    drawCallouts(st, ox, oy, vw, vh, im);
+  }
+  // technique names: punch in, hold, fade
+  function drawCallouts(st, ox, oy, vw, vh, im) {
+    const sc = vw / W;
+    for (const co of callouts) {
+      const age = fxT - co.t, a = Math.min(1, (1.2 - age) / 0.35), pop = 1 + 0.5 * Math.max(0, 1 - age / 0.12);
+      const size = Math.round(30 * Math.max(0.6, sc) * pop), x = clamp(ox + co.x * sc, ox + 120 * sc, ox + vw - 120 * sc), y = clamp(oy + co.y * sc - 40 * sc, oy + 60, oy + vh - 40);
+      const fg = im ? im[1] : st.hot, ink = im ? im[0] : st.bg;
+      ctx.globalAlpha = Math.max(0, a); ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+      ctx.font = `700 ${size}px ${MONO}`; ctx.lineWidth = Math.max(3, size / 7); ctx.strokeStyle = rgba(ink, 0.9);
+      ctx.strokeText(co.text, x, y); ctx.fillStyle = rgba(fg, 1); ctx.fillText(co.text, x, y);
+      ctx.font = `600 ${Math.round(size * 0.5)}px ${MONO}`; ctx.lineWidth = Math.max(2, size / 12);
+      ctx.strokeText(co.kanji, x, y - size * 0.95); ctx.fillStyle = rgba(st.red, 1); ctx.fillText(co.kanji, x, y - size * 0.95);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    if (grid) {
+      const hw = Math.floor(W / 2), hh = Math.floor(H / 2);
+      STYLES.forEach((st, i) => renderView(st, (i % 2) * hw, Math.floor(i / 2) * hh, hw, hh, 0.5, i));
+      ctx.fillStyle = '#000'; ctx.fillRect(hw - 1, 0, 2, H); ctx.fillRect(0, hh - 1, W, 2);
+    } else renderView(STYLES[styleIx], 0, 0, W, H, 1, 'main');
+  }
+
+  // ---------- lifecycle ----------
+  function resize() {
+    const oW = W, oH = H;
+    const box = canvas.getBoundingClientRect(); // the canvas's own box: hosts may pad the page
+    W = Math.round(box.width) || window.innerWidth; H = Math.round(box.height) || window.innerHeight;
+    dpr = recording ? Math.min(window.devicePixelRatio || 1, W >= H ? Math.min(1920 / W, 1200 / H) : Math.min(1200 / W, 1900 / H)) : Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.max(1, Math.round(W * dpr)); canvas.height = Math.max(1, Math.round(H * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    baked.clear();
+    if (!W || !H) return;
+    s = Math.min(W, H) / 900;
+    if (!oW || !oH || oW !== W || oH !== H) { const t = simT, h = holdBeat; holdBeat = false; sfx.quiet = true; reset(); for (let i = 0; i < t / STEP; i++) step(STEP); sfx.quiet = false; holdBeat = h; } // re-run to the same moment, even when held
+    document.documentElement.style.setProperty('--help', STYLES[styleIx].help);
+  }
+
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (!W || !H) return;
+    updateTsukuyomi(dt);
+    if (swipe.pts.length && now - swipe.last > 90) endSwipe();
+    if (!paused) { acc += dt * (tsu.on ? 0.25 : 1); while (acc >= STEP) { step(STEP); acc -= STEP; } }
+    draw();
+    const chi = bolts.length ? 0.3 + 0.7 * (bolts.c ? bolts.c.charge : 0) : 0;
+    sfx.update({ rain: paused ? 0 : rainSpeed(simT), slow: tsu.on, fire: paused ? 0 : Math.min(1, fireMax * 1.2), chidori: paused ? 0 : chi,
+      kamui: Math.min(1, Math.abs(kam.s)), spin: simT > 8 && simT < 9.3 && !paused ? easeIn((simT - 8) / 1.3) : 0, drone: aperture(simT) });
+    if (!paused) {
+      if (chi && Math.random() < (25 + 60 * chi) * dt) sfx.chirps(1 + (Math.random() * 3 * chi | 0)); // Chidori: a thousand birds
+      if (fireMax > 0.1 && Math.random() < fireMax * 18 * dt) sfx.pops(1);
+      if (tsu.on && now > heartAt) { sfx.heartbeat(); heartAt = now + 900; }
+    }
+  }
+  let heartAt = 0;
+
+  function record() {
+    if (recording || !window.MediaRecorder) return;
+    sfx.init();
+    const audio = sfx.stream && sfx.enabled ? sfx.stream.getAudioTracks() : [];
+    const type = [...(audio.length ? ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/webm;codecs=vp9,opus'] : []), 'video/mp4;codecs=avc1.640028', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
+    recording = true; paused = false; pointer.down = false;
+    document.body.classList.add('rec');
+    resize(); reset();
+    const stream = new MediaStream([...canvas.captureStream(60).getVideoTracks(), ...(type.includes('mp4a') || type.includes('opus') ? audio : [])]);
+    const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 20e6 });
+    const chunks = [];
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = () => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob(chunks, { type }));
+      a.download = `uchiha-${grid ? 'grid' : STYLES[styleIx].id}.${type.includes('mp4') ? 'mp4' : 'webm'}`;
+      a.click();
+      recording = false; document.body.classList.remove('rec'); resize();
+    };
+    rec.start();
+    setTimeout(() => rec.stop(), LOOP * 1000);
+  }
+
+  function nextBeat() {
+    const i = BEATS.findIndex(b => b[0] > simT + 0.05);
+    const nb = i >= 0 ? BEATS[i] : null;
+    const t = holdBeat ? SHOWCASE[i >= 0 ? i : 0] : nb ? nb[0] : 0;
+    if (!nb) { crows = []; debris = []; rings = []; fire.fill(0); fireMax = 0; spinA = 0; }
+    simT = t - 0.001; bolts = [];
+  }
+
+  new ResizeObserver(() => resize()).observe(canvas);
+  // in grid mode a quadrant shows the whole frame at half size: map the pointer into that frame
+  const toWorld = e => {
+    const r = canvas.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    if (!grid) return [x, y];
+    const hw = Math.floor(W / 2), hh = Math.floor(H / 2);
+    return [(x % hw) * W / hw, (y % hh) * H / hh];
+  };
+  const move = e => {
+    const now = performance.now(), [x, y] = toWorld(e), dtm = Math.max(1, now - (pointer.lastT || now - 16));
+    const v = Math.hypot(x - pointer.x, y - pointer.y) / dtm * 1000, vx = (x - pointer.x) / dtm * 1000, px0 = pointer.x, py0 = pointer.y;
+    pointer.x = x; pointer.y = y; pointer.inside = true; pointer.moved = now; pointer.lastT = now;
+    if (recording) return;
+    if (pointer.down) {
+      stroke.push(x, y);
+      if (!pointer.drawing && Math.hypot(x - pointer.downX, y - pointer.downY) > 30 * s) pointer.drawing = true;
+    } else if (v > 3000 * s && !tsu.on) { if (!swipe.pts.length && dtm < 50) swipe.pts.push(px0, py0); swipe.pts.push(x, y); swipe.last = now; }
+    else if (swipe.pts.length) endSwipe();
+    if (tsu.on && Math.abs(vx) > 1300 * s && Math.sign(vx) !== tsu.sign) { // shaking: count direction flips
+      tsu.sign = Math.sign(vx); tsu.flips.push(now);
+      tsu.flips = tsu.flips.filter(f => now - f < 800);
+      if (tsu.flips.length >= 4) breakFree();
+    }
+  };
+  canvas.addEventListener('pointermove', move);
+  canvas.addEventListener('pointerdown', e => {
+    sfx.init();
+    const [x, y] = toWorld(e);
+    pointer.x = x; pointer.y = y; pointer.inside = true; pointer.moved = pointer.lastT = performance.now();
+    pointer.down = true; pointer.downAt = performance.now(); pointer.downX = x; pointer.downY = y; pointer.drawing = false;
+    swipe.pts = []; // pressing ends any flick: it's a click, hold or drawing now
+    stroke = [x, y];
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointerup', () => {
+    if (!pointer.down) return;
+    pointer.down = false;
+    if (recording) { stroke = []; return; }
+    const hold = (performance.now() - pointer.downAt) / 1000;
+    if (pointer.drawing) { // a drawn seal
+      const r = analyze(stroke);
+      if (r && r.kind === 'circle') ignite(r.x, r.y, r.r);
+      else if (r && r.kind === 'line') doSlash(stroke.slice());
+      pointer.drawing = false; stroke = [];
+      return;
+    }
+    stroke = [];
+    if (hold < 0.22) throwKunai(pointer.x, pointer.y);
+    else { const c = Math.min(1, (hold - 0.22) / 1.3); boom(pointer.x, pointer.y, 0.35 + 0.65 * c); userSL = { x: pointer.x, y: pointer.y, t: fxT }; shout('CHIDORI', '千鳥', pointer.x, pointer.y); }
+  });
+  canvas.addEventListener('pointerleave', () => { pointer.inside = false; });
+  canvas.addEventListener('wheel', e => { // Kamui
+    e.preventDefault();
+    if (recording) return;
+    const [x, y] = toWorld(e);
+    kam.x = x; kam.y = y;
+    if (Math.abs(kam.s) < 0.05) shout('KAMUI', '神威', x, y);
+    kam.s = clamp(kam.s + Math.sign(e.deltaY) * Math.min(0.5, Math.abs(e.deltaY) / 200 + 0.05), -1.6, 1.6);
+  }, { passive: false });
+  window.addEventListener('keydown', e => {
+    sfx.init();
+    if (e.key === 'm' || e.key === 'M') { sfx.toggle(); return; }
+    if (recording) return;
+    if (e.key === 'ArrowRight') { nextBeat(); return; }
+    if (e.key === 'ArrowLeft') { reset(); return; }
+    if (e.key === 'h' || e.key === 'H') { holdBeat = !holdBeat; return; }
+    if (e.key === 'Escape' && tsu.on) { breakFree(); return; }
+    if (e.key >= '1' && e.key <= '4') { styleIx = +e.key - 1; grid = false; document.documentElement.style.setProperty('--help', STYLES[styleIx].help); }
+    else if (e.key === 'g' || e.key === 'G') grid = !grid;
+    else if (e.key === 'r' || e.key === 'R') record();
+    else if (e.key === ' ') { paused = !paused; e.preventDefault(); }
+  });
+
+  resize();
+  // ?t=9.4 jumps to that moment of the cut (used for still captures)
+  const warm = clamp(+q.get('t') || 0, 0, LOOP - 0.01);
+  if (W && H && warm) { const h = holdBeat; holdBeat = false; reset(); for (let i = 0; i < warm / STEP; i++) step(STEP); holdBeat = h; paused = !q.has('play') && !h; }
+  sfx.quiet = false;
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (!warm && W && H) for (let i = 0; i < 9.6 / STEP; i++) step(STEP);
+    paused = true;
+    help.textContent = 'paused for reduced motion · space to play · 1–4 style · G grid';
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
