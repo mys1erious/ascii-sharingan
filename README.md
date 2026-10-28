@@ -15,4 +15,4 @@ Click, swipe or draw a circle to interact.
 | `?t=9.6` | Freeze on that moment; add `&play` to keep running from there |
 | `?seed=11` | Change the random seed (rain and crow layout) |
 
-Built with Claude Code. Fan art, not affiliated with Naruto or its owners.
+Fan art, not affiliated with Naruto or its owners.
